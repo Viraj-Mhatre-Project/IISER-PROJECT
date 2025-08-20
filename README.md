@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Vehicle Detection and Tracking with SORT Algorithm
 
 This project implements a complete vehicle detection and tracking system using **SORT (Simple Online and Realtime Tracking)** algorithm and **YOLOv8** for object detection.
@@ -196,3 +197,6 @@ If you encounter any issues:
 ---
 
 **Happy Vehicle Tracking! 🚗📹**
+=======
+# IISER-PROJECT
+>>>>>>> 6469a7085d54c2defd2c387d7d9bdc1d48e23d30

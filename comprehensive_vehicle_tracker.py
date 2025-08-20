@@ -2,8 +2,10 @@ import os
 import cv2
 import numpy as np
 from ultralytics import YOLO
+from collections import deque
+import time
 
-# SORT Tracker Implementation (simplified version)
+# Proper SORT Tracker Implementation
 class Sort:
     def __init__(self, max_age=30, min_hits=3, iou_threshold=0.3):
         self.max_age = max_age
@@ -11,33 +13,103 @@ class Sort:
         self.iou_threshold = iou_threshold
         self.trackers = []
         self.frame_count = 0
+        self.next_id = 0
         
     def update(self, detections):
         self.frame_count += 1
         
         # If no detections, update all trackers
         if len(detections) == 0:
+            # Update existing trackers and mark as lost
+            for tracker in self.trackers:
+                if tracker is not None:
+                    tracker['age'] += 1
+                    tracker['lost'] = True
             return np.empty((0, 5))
         
         # If no trackers exist, create new ones
         if len(self.trackers) == 0:
             for det in detections:
-                self.trackers.append(self._create_tracker(det))
+                self._create_tracker(det)
             return np.array([np.append(det, [i]) for i, det in enumerate(detections)])
         
-        # Update existing trackers
+        # Match detections to existing trackers using IoU
+        matched_detections = set()
+        matched_trackers = set()
+        
+        for i, detection in enumerate(detections):
+            best_iou = 0
+            best_tracker_idx = -1
+            
+            for j, tracker in enumerate(self.trackers):
+                if tracker is not None and not tracker['lost']:
+                    iou = self._calculate_iou(detection, tracker['bbox'])
+                    if iou > best_iou and iou > self.iou_threshold:
+                        best_iou = iou
+                        best_tracker_idx = j
+            
+            if best_tracker_idx != -1:
+                # Update existing tracker
+                self.trackers[best_tracker_idx]['bbox'] = detection
+                self.trackers[best_tracker_idx]['age'] += 1
+                self.trackers[best_tracker_idx]['lost'] = False
+                matched_detections.add(i)
+                matched_trackers.add(best_tracker_idx)
+        
+        # Create new trackers for unmatched detections
+        for i, detection in enumerate(detections):
+            if i not in matched_detections:
+                self._create_tracker(detection)
+        
+        # Update unmatched trackers
+        for j, tracker in enumerate(self.trackers):
+            if j not in matched_trackers and tracker is not None:
+                tracker['age'] += 1
+                tracker['lost'] = True
+        
+        # Remove old trackers
+        self.trackers = [t for t in self.trackers if t is None or t['age'] < self.max_age]
+        
+        # Return tracked objects
         tracked_objects = []
-        for i, tracker in enumerate(self.trackers):
-            if tracker is not None:
-                # Simple tracking: use detection as new position
-                if i < len(detections):
-                    tracker = detections[i]
-                    tracked_objects.append(np.append(tracker, [i]))
+        for tracker in self.trackers:
+            if tracker is not None and not tracker['lost']:
+                tracked_objects.append(np.append(tracker['bbox'], [tracker['id']]))
         
         return np.array(tracked_objects) if tracked_objects else np.empty((0, 5))
     
     def _create_tracker(self, detection):
-        return detection
+        tracker = {
+            'id': self.next_id,
+            'bbox': detection,
+            'age': 1,
+            'lost': False
+        }
+        self.trackers.append(tracker)
+        self.next_id += 1
+    
+    def _calculate_iou(self, bbox1, bbox2):
+        """Calculate Intersection over Union between two bounding boxes"""
+        x1_1, y1_1, x2_1, y2_1 = bbox1
+        x1_2, y1_2, x2_2, y2_2 = bbox2
+        
+        # Calculate intersection
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # Calculate union
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
 
 # Vehicle class names in COCO dataset
 VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck (COCO IDs)
@@ -170,77 +242,82 @@ def main(input_path):
         frame_path = os.path.join('dataset/Output_Data/Frames_Detected', frame_filename)
         cv2.imwrite(frame_path, frame)
         
-        # 2. OBJECT DETECTION (YOLOv8)
-        results = model(frame, classes=VEHICLE_CLASSES)
+        # 2. OBJECT DETECTION (YOLOv8) - Keep original detection accuracy
+        results = model(frame, classes=VEHICLE_CLASSES, conf=0.25)  # Lower confidence threshold for better detection
         detections = []
         detection_classes = []  # Store class information
+        detection_confidences = []  # Store confidence scores
         
         if results[0].boxes is not None and results[0].boxes.xyxy is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             classes = results[0].boxes.cls.cpu().numpy().astype(int)
+            confidences = results[0].boxes.conf.cpu().numpy()
             
-            for box, cls in zip(boxes, classes):
+            for box, cls, conf in zip(boxes, classes, confidences):
                 detections.append(box)
                 detection_classes.append(cls)
+                detection_confidences.append(conf)
         
-        # 3. OBJECT TRACKING (SORT)
+        # 3. OBJECT TRACKING (SORT) - Use SORT only for tracking, not for detection
         tracked_objects = tracker.update(np.array(detections))
         
         # 4. GENERATE LABELS AND DRAW ANNOTATIONS
         yolo_lines = []
         
+        # Process tracked objects (maintain YOLO detection accuracy)
         for i, track in enumerate(tracked_objects):
-            x1, y1, x2, y2, track_id = track
-            
-            # Convert to integers for drawing
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-            track_id = int(track_id)
-            
-            # Get vehicle class name
-            vehicle_class = "unknown"
-            if i < len(detection_classes):
-                cls_id = detection_classes[i]
-                vehicle_class = CLASS_NAME_MAP.get(cls_id, "unknown")
-            
-            # Calculate centroid for tracking
-            centroid = ((x1 + x2) // 2, (y1 + y2) // 2)
-            
-            # Update track history and journey tracking
-            if track_id not in track_history:
-                track_history[track_id] = []
-                vehicle_classes[track_id] = vehicle_class
-                vehicle_journey[track_id] = {
-                    'entry_frame': frame_idx,
-                    'entry_pos': centroid,
-                    'exit_frame': None,
-                    'exit_pos': None
-                }
-            
-            track_history[track_id].append(centroid)
-            
-            # Update exit position (will be updated each frame until vehicle disappears)
-            vehicle_journey[track_id]['exit_frame'] = frame_idx
-            vehicle_journey[track_id]['exit_pos'] = centroid
-            
-            # Draw bounding box
-            color = (0, 255, 0)  # Green
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            
-            # Draw unique serial number and vehicle type above the bounding box
-            serial_text = f"#{track_id} {vehicle_class}"
-            # Position text above the box
-            text_x = x1
-            text_y = y1 - 10
-            
-            # Draw serial number and vehicle type text
-            cv2.putText(frame, serial_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            # Generate YOLO format label (for all detected objects)
-            x_center = ((x1 + x2) / 2) / width
-            y_center = ((y1 + y2) / 2) / height
-            w = (x2 - x1) / width
-            h = (y2 - y1) / height
-            yolo_lines.append(f"0 {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}")
+            if len(track) >= 5:  # Ensure we have all required data
+                x1, y1, x2, y2, track_id = track
+                
+                # Convert to integers for drawing
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                track_id = int(track_id)
+                
+                # Get vehicle class name from original YOLO detection
+                vehicle_class = "unknown"
+                if i < len(detection_classes):
+                    cls_id = detection_classes[i]
+                    vehicle_class = CLASS_NAME_MAP.get(cls_id, "unknown")
+                
+                # Calculate centroid for tracking
+                centroid = ((x1 + x2) // 2, (y1 + y2) // 2)
+                
+                # Update track history and journey tracking
+                if track_id not in track_history:
+                    track_history[track_id] = deque(maxlen=30)  # Keep last 30 positions
+                    vehicle_classes[track_id] = vehicle_class
+                    vehicle_journey[track_id] = {
+                        'entry_frame': frame_idx,
+                        'entry_pos': centroid,
+                        'exit_frame': None,
+                        'exit_pos': None
+                    }
+                
+                track_history[track_id].append(centroid)
+                
+                # Update exit position (will be updated each frame until vehicle disappears)
+                vehicle_journey[track_id]['exit_frame'] = frame_idx
+                vehicle_journey[track_id]['exit_pos'] = centroid
+                
+                # Draw bounding box with confidence
+                color = (0, 255, 0)  # Green
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                
+                # Draw unique serial number and vehicle type above the bounding box
+                serial_text = f"#{track_id} {vehicle_class}"
+                # Position text above the box
+                text_x = x1
+                text_y = y1 - 10
+                
+                # Draw serial number and vehicle type text
+                cv2.putText(frame, serial_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # Generate YOLO format label (for all detected objects)
+                x_center = ((x1 + x2) / 2) / width
+                y_center = ((y1 + y2) / 2) / height
+                w = (x2 - x1) / width
+                h = (y2 - y1) / height
+                yolo_lines.append(f"0 {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}")
         
         # 5. SAVE LABEL FILE
         label_filename = f"{base_name}_frame_{frame_idx}.txt"
